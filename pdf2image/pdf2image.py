@@ -350,38 +350,158 @@ def convert_from_bytes(
     :rtype: List[Image.Image]
     """
 
-    fh, temp_filename = tempfile.mkstemp()
+    if use_pdftocairo and fmt == "ppm":
+        fmt = "png"
+
+    if isinstance(output_folder, PurePath):
+        output_folder = output_folder.as_posix()
+
+    if isinstance(poppler_path, PurePath):
+        poppler_path = poppler_path.as_posix()
+
+    page_count = pdfinfo_from_bytes(
+        pdf_file, userpw, ownerpw, poppler_path=poppler_path
+    )["Pages"]
+
+    # We start by getting the output format, the buffer processing function and if we need pdftocairo
+    parsed_fmt, final_extension, parse_buffer_func, use_pdfcairo_format = _parse_format(
+        fmt, grayscale
+    )
+
+    # We use pdftocairo is the format requires it OR we need a transparent output
+    use_pdfcairo = (
+            use_pdftocairo
+            or use_pdfcairo_format
+            or (transparent and parsed_fmt in TRANSPARENT_FILE_TYPES)
+    )
+
+    poppler_version_major, poppler_version_minor = _get_poppler_version(
+        "pdftocairo" if use_pdfcairo else "pdftoppm", poppler_path=poppler_path
+    )
+
+    if poppler_version_major == 0 and poppler_version_minor <= 57:
+        jpegopt = None
+
+    if poppler_version_major == 0 and poppler_version_minor <= 83:
+        hide_annotations = False
+
+    # If output_file isn't a generator, it will be turned into one
+    if not isinstance(output_file, types.GeneratorType) and not isinstance(
+            output_file, ThreadSafeGenerator
+    ):
+        if single_file:
+            output_file = iter([output_file])
+        else:
+            output_file = counter_generator(output_file)
+
+    if thread_count < 1:
+        thread_count = 1
+
+    if first_page is None or first_page < 1:
+        first_page = 1
+
+    if last_page is None or last_page > page_count:
+        last_page = page_count
+
+    if first_page > last_page:
+        return []
+
     try:
-        with open(temp_filename, "wb") as f:
-            f.write(pdf_file)
-            f.flush()
-            return convert_from_path(
-                f.name,
-                dpi=dpi,
-                output_folder=output_folder,
-                first_page=first_page,
-                last_page=last_page,
-                fmt=fmt,
-                jpegopt=jpegopt,
-                thread_count=thread_count,
-                userpw=userpw,
-                ownerpw=ownerpw,
-                use_cropbox=use_cropbox,
-                strict=strict,
-                transparent=transparent,
-                single_file=single_file,
-                output_file=output_file,
-                poppler_path=poppler_path,
-                grayscale=grayscale,
-                size=size,
-                paths_only=paths_only,
-                use_pdftocairo=use_pdftocairo,
-                timeout=timeout,
-                hide_annotations=hide_annotations,
+        auto_temp_dir = False
+        if output_folder is None and use_pdfcairo:
+            output_folder = tempfile.mkdtemp()
+            auto_temp_dir = True
+
+        # Recalculate page count based on first and last page
+        page_count = last_page - first_page + 1
+
+        if thread_count > page_count:
+            thread_count = page_count
+
+        reminder = page_count % thread_count
+        current_page = first_page
+        processes = []
+        for _ in range(thread_count):
+            thread_output_file = next(output_file)
+
+            # Get the number of pages the thread will be processing
+            thread_page_count = page_count // thread_count + int(reminder > 0)
+            # Build the command accordingly
+            args = _build_command(
+                ["-r", str(dpi)],
+                output_folder,
+                current_page,
+                current_page + thread_page_count - 1,
+                parsed_fmt,
+                jpegopt,
+                thread_output_file,
+                userpw,
+                ownerpw,
+                use_cropbox,
+                transparent,
+                single_file,
+                grayscale,
+                size,
+                hide_annotations,
             )
+
+            if use_pdfcairo:
+                if hide_annotations:
+                    raise NotImplementedError(
+                        "Hide annotations flag not implemented in pdftocairo."
+                    )
+                args = [_get_command_path("pdftocairo", poppler_path)] + args + ["-", "-"]
+            else:
+                args = [_get_command_path("pdftoppm", poppler_path)] + args + ["-"]
+
+            # Update page values
+            current_page = current_page + thread_page_count
+            reminder -= int(reminder > 0)
+            # Add poppler path to LD_LIBRARY_PATH
+            env = os.environ.copy()
+            if poppler_path is not None:
+                env["LD_LIBRARY_PATH"] = (
+                        poppler_path + ":" + env.get("LD_LIBRARY_PATH", "")
+                )
+            # Spawn the process and save its uuid
+            startupinfo = None
+            if platform.system() == "Windows":
+                # this startupinfo structure prevents a console window from popping up on Windows
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+
+            proc = Popen(args, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE, startupinfo=startupinfo)
+            proc.stdin.write(pdf_file)
+            processes.append((thread_output_file, proc))
+
+        images = []
+
+        for uid, proc in processes:
+            try:
+                data, err = proc.communicate(timeout=timeout)
+            except TimeoutExpired:
+                proc.kill()
+                outs, errs = proc.communicate()
+                raise PDFPopplerTimeoutError("Run poppler timeout.")
+
+            if b"Syntax Error" in err and strict:
+                raise PDFSyntaxError(err.decode("utf8", "ignore"))
+
+            if output_folder is not None:
+                images += _load_from_output_folder(
+                    output_folder,
+                    uid,
+                    final_extension,
+                    paths_only,
+                    in_memory=auto_temp_dir,
+                )
+            else:
+                images += parse_buffer_func(data)
     finally:
-        os.close(fh)
-        os.remove(temp_filename)
+        if auto_temp_dir:
+            shutil.rmtree(output_folder)
+
+    return images
 
 
 def _build_command(
@@ -625,22 +745,59 @@ def pdfinfo_from_bytes(
     :return: Dictionary containing various information on the PDF
     :rtype: Dict
     """
-    fh, temp_filename = tempfile.mkstemp()
     try:
-        with open(temp_filename, "wb") as f:
-            f.write(pdf_bytes)
-            f.flush()
-        return pdfinfo_from_path(
-            temp_filename,
-            userpw=userpw,
-            ownerpw=ownerpw,
-            poppler_path=poppler_path,
-            rawdates=rawdates,
-            timeout=timeout,
+        command = [_get_command_path("pdfinfo", poppler_path)]
+
+        if userpw is not None:
+            command.extend(["-upw", userpw])
+
+        if ownerpw is not None:
+            command.extend(["-opw", ownerpw])
+
+        if rawdates:
+            command.extend(["-rawdates"])
+
+        command.append("-")
+
+        # Add poppler path to LD_LIBRARY_PATH
+        env = os.environ.copy()
+        if poppler_path is not None:
+            env["LD_LIBRARY_PATH"] = poppler_path + ":" + env.get("LD_LIBRARY_PATH", "")
+
+        proc = Popen(command, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE)
+        proc.stdin.write(pdf_bytes)
+
+        try:
+            out, err = proc.communicate(timeout=timeout)
+        except TimeoutExpired:
+            proc.kill()
+            outs, errs = proc.communicate()
+            raise PDFPopplerTimeoutError("Run poppler poppler timeout.")
+
+        d = {}
+        for field in out.decode("utf8", "ignore").split("\n"):
+            sf = field.split(":")
+            key, value = sf[0], ":".join(sf[1:])
+            if key != "":
+                d[key] = (
+                    int(value.strip())
+                    if key in PDFINFO_CONVERT_TO_INT
+                    else value.strip()
+                )
+
+        if "Pages" not in d:
+            raise ValueError
+
+        return d
+
+    except OSError:
+        raise PDFInfoNotInstalledError(
+            "Unable to get page count. Is poppler installed and in PATH?"
         )
-    finally:
-        os.close(fh)
-        os.remove(temp_filename)
+    except ValueError:
+        raise PDFPageCountError(
+            f"Unable to get page count.\n{err.decode('utf8', 'ignore')}"
+        )
 
 
 def _load_from_output_folder(
