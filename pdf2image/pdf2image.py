@@ -9,6 +9,7 @@ import tempfile
 import types
 import shutil
 import subprocess
+import threading
 from subprocess import Popen, PIPE, TimeoutExpired
 from typing import Any, Union, Tuple, List, Dict, Callable
 from pathlib import PurePath
@@ -171,8 +172,8 @@ def convert_from_path(
     if first_page > last_page:
         return []
 
+    auto_temp_dir = False
     try:
-        auto_temp_dir = False
         if output_folder is None and use_pdfcairo:
             output_folder = tempfile.mkdtemp()
             auto_temp_dir = True
@@ -406,8 +407,30 @@ def convert_from_bytes(
     if first_page > last_page:
         return []
 
+    class DaemonThread(threading.Thread):
+        def __init__(self, pdf, args, env, startupinfo, timeout):
+            self.stdout = None
+            self.stderr = None
+            threading.Thread.__init__(self)
+            self.pdf = pdf
+            self.args = args
+            self.env = env
+            self.startupinfo = startupinfo
+            self.timeout = timeout
+
+        def run(self):
+            proc = Popen(self.args, env=self.env, stdin=PIPE, stdout=PIPE, stderr=PIPE, startupinfo=self.startupinfo)
+            try:
+                self.stdout, self.stderr = proc.communicate(input=self.pdf, timeout=self.timeout)
+            except TimeoutExpired:
+                proc.kill()
+                self.stdout, self.stderr = proc.communicate()
+                self.stderr = b'Run poppler timeout.'
+                # raise PDFPopplerTimeoutError("Run poppler timeout.")
+            proc.stdin.close()
+
+    auto_temp_dir = False
     try:
-        auto_temp_dir = False
         if output_folder is None and use_pdfcairo:
             output_folder = tempfile.mkdtemp()
             auto_temp_dir = True
@@ -420,7 +443,7 @@ def convert_from_bytes(
 
         reminder = page_count % thread_count
         current_page = first_page
-        processes = []
+        threads = []
         for _ in range(thread_count):
             thread_output_file = next(output_file)
 
@@ -470,22 +493,18 @@ def convert_from_bytes(
                 startupinfo = subprocess.STARTUPINFO()
                 startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
 
-            proc = Popen(args, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE, startupinfo=startupinfo)
-            proc.stdin.write(pdf_file)
-            processes.append((thread_output_file, proc))
+            thread = DaemonThread(pdf_file, args, env, startupinfo, timeout)
+            thread.start()
+            threads.append((thread_output_file, thread))
 
         images = []
 
-        for uid, proc in processes:
-            try:
-                data, err = proc.communicate(timeout=timeout)
-            except TimeoutExpired:
-                proc.kill()
-                outs, errs = proc.communicate()
-                raise PDFPopplerTimeoutError("Run poppler timeout.")
+        for _, thread in threads:
+            thread.join()
 
-            if b"Syntax Error" in err and strict:
-                raise PDFSyntaxError(err.decode("utf8", "ignore"))
+        for uid, thread in threads:
+            if b"Syntax Error" in thread.stderr and strict:
+                raise PDFSyntaxError(thread.stderr.decode("utf8", "ignore"))
 
             if output_folder is not None:
                 images += _load_from_output_folder(
@@ -496,7 +515,7 @@ def convert_from_bytes(
                     in_memory=auto_temp_dir,
                 )
             else:
-                images += parse_buffer_func(data)
+                images += parse_buffer_func(thread.stdout)
     finally:
         if auto_temp_dir:
             shutil.rmtree(output_folder)
@@ -765,10 +784,8 @@ def pdfinfo_from_bytes(
             env["LD_LIBRARY_PATH"] = poppler_path + ":" + env.get("LD_LIBRARY_PATH", "")
 
         proc = Popen(command, env=env, stdin=PIPE, stdout=PIPE, stderr=PIPE)
-        proc.stdin.write(pdf_bytes)
-
         try:
-            out, err = proc.communicate(timeout=timeout)
+            out, err = proc.communicate(input=pdf_bytes, timeout=timeout)
         except TimeoutExpired:
             proc.kill()
             outs, errs = proc.communicate()
